@@ -2,7 +2,7 @@
 
 Verified on 2026-10-03 with Python 3.12.14 on Windows, using the pinned requirements.
 
-**20 tests passed in 36.10 seconds.** The three remaining warnings are pending deprecations inside SHAP's Matplotlib color-map setup. No convergence warnings or model-fit failures occurred. `python -m pip check` reports no broken requirements.
+**36 tests passed in 37.83 seconds after the WAV compatibility fix.** The three remaining warnings are pending deprecations inside SHAP's Matplotlib color-map setup. No convergence warnings or model-fit failures occurred. `python -m pip check` reports no broken requirements.
 
 Checks cover:
 
@@ -17,10 +17,13 @@ Checks cover:
 - Explicit patient IDs are preserved; strict UCI name parsing is used only when IDs are absent.
 - Single-class fold metrics are represented as undefined where appropriate, and the metric formulas are checked against a hand-calculated example.
 - A generated 150 Hz WAV returns the expected measured pitch; silent and invalid inputs are rejected. No fabricated acoustic features are returned.
+- The exact reported `unknown extended format: 00000003-0000-0010-8000-00aa00389b71` exception is reproduced using Python's old decoder and a generated two-second WAVEX FLOAT file. The revised reader analyzes the same bytes successfully and emits the short-recording warning.
+- WAV PCM16/24/32, WAV float32/64, WAVEX PCM24/float32 and RF64 float32 are checked in mono/stereo configurations. Float64 samples survive decoding unchanged; duration and sample rate are preserved.
+- Out-of-range durations, unsupported rates, multichannel audio, non-WAV content, empty/oversized payloads and non-finite samples are rejected.
 - Acoustic feature rows are matched by recording ID, with mismatches and duplicate filenames rejected.
 - The original CSS is unchanged after normalizing the pasted non-breaking spaces. The recorder configuration is preserved. Random sample splitting and Plotly gauges are absent.
 - DOCX bytes open as a valid OOXML ZIP, retain all five tables, include actual metrics, and omit hardcoded performance and unsupported diagnosis/treatment text.
-- Streamlit AppTest loads all six tabs, reports missing training data clearly, runs prediction, changes SHAP mode without losing the prediction, clears stale results after an input change, and tolerates empty filters.
+- Streamlit AppTest loads all six tabs, reports missing training data clearly, runs prediction, changes SHAP mode without losing the prediction, clears stale results after an input change, and tolerates empty filters. It also simulates a two-second floating-point WAV upload and clicks Analyze, verifying measured results and the short-recording warning without an error.
 
 All model tests use a generated 20-person, 60-recording synthetic fixture. These are software verification results, not clinical performance estimates. No previous task's training data or pretrained model was used.
 

@@ -12,7 +12,8 @@ from sklearn.feature_selection import SelectFromModel
 from sklearn.pipeline import Pipeline
 from threadpoolctl import threadpool_limits
 from pathlib import Path
-import hashlib, json, re, wave, importlib.metadata
+import hashlib, json, re, importlib.metadata
+import soundfile as sf
 import shap
 from streamlit_shap import st_shap
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, f1_score, matthews_corrcoef
 import warnings
 # Keep convergence and compatibility warnings visible during research.
-import tempfile, os, random
+import random
 import parselmouth
 from datetime import datetime
 from io import BytesIO
@@ -1082,11 +1083,48 @@ def generate_voice_docx(name, age, gender, healthy_prob, parkinson_prob,
     buf.seek(0)
     return buf
 
-def extract_voice_features(file_path):
+def decode_wav(audio_bytes):
+    """Decode PCM and IEEE-float WAV/WAVEX safely without Python wave's PCM-only limit."""
+    if not audio_bytes:
+        raise ValueError("The uploaded recording is empty.")
+    if len(audio_bytes) > 20 * 1024 * 1024:
+        raise ValueError("Each WAV must be at most 20 MB.")
+    try:
+        with sf.SoundFile(BytesIO(audio_bytes)) as audio:
+            if audio.format not in {"WAV", "WAVEX", "RF64"}:
+                raise ValueError("This file is not a WAV recording. Export it as WAV; changing the extension is not enough.")
+            sr, frames, channels = audio.samplerate, audio.frames, audio.channels
+            if not 16000 <= sr <= 96000:
+                raise ValueError(f"Sample rate is {sr} Hz; use a WAV between 16000 and 96000 Hz.")
+            if channels not in (1, 2):
+                raise ValueError(f"This recording has {channels} channels; use mono or stereo WAV.")
+            duration = frames / sr
+            if not 1.0 <= duration <= 30.0:
+                raise ValueError(f"Recording duration is {duration:.2f} seconds; use 1–30 seconds (5–10 recommended).")
+            # Check header bounds before allocating/decoding audio. No resampling,
+            # padding, amplitude normalization or conversion to lossy integer PCM.
+            samples = audio.read(frames=frames, dtype="float64", always_2d=True)
+            if samples.shape != (frames, channels) or not np.isfinite(samples).all():
+                raise ValueError("The recording is incomplete or contains non-finite samples. Re-export it as WAV.")
+            quality_warnings = []
+            if duration < 3:
+                quality_warnings.append("Short recording: fewer than 3 seconds. Prefer a steady 5–10 second vowel for feature analysis.")
+            if np.any(np.abs(samples) >= 0.999):
+                quality_warnings.append("Some samples reach full scale. Check for clipping or excessive recording gain.")
+            info = {"duration_seconds": duration, "sample_rate_hz": sr,
+                    "channels": channels, "format": audio.format, "subtype": audio.subtype,
+                    "warnings": quality_warnings}
+    except (sf.LibsndfileError, OSError) as exc:
+        raise ValueError("This WAV could not be decoded. Re-export it as PCM or IEEE-float WAV and try again.") from exc
+    return samples, sr, info
+
+
+def extract_voice_features(samples, sample_rate):
     """Measure four real descriptors. Never fabricate the other 18 classifier inputs."""
-    sound = parselmouth.Sound(str(file_path))
-    if not 3 <= sound.duration <= 30:
-        raise ValueError("Use a WAV recording between 3 and 30 seconds.")
+    # SoundFile returns samples x channels; Praat expects channels x samples.
+    sound = parselmouth.Sound(np.asarray(samples, dtype=np.float64).T, sampling_frequency=sample_rate)
+    if not 1 <= sound.duration <= 30:
+        raise ValueError("Use a WAV recording between 1 and 30 seconds.")
     if not 16000 <= sound.sampling_frequency <= 96000:
         raise ValueError("Use a sample rate between 16 and 96 kHz.")
     if sound.n_channels > 2 or not np.isfinite(sound.values).all():
@@ -1107,23 +1145,10 @@ def extract_voice_features(file_path):
     return {"MDVP:Fo(Hz)": fo, "MDVP:Fhi(Hz)": fhi, "MDVP:Flo(Hz)": flo, "HNR": hnr}
 
 
-def measure_wav(audio_bytes):
-    if len(audio_bytes) > 20 * 1024 * 1024:
-        raise ValueError("Each WAV must be at most 20 MB.")
-    # Header check before Praat decodes; rejects long/compressed malformed payloads.
-    with wave.open(BytesIO(audio_bytes), "rb") as audio_header:
-        duration = audio_header.getnframes() / audio_header.getframerate()
-        if not 3 <= duration <= 30 or audio_header.getnchannels() not in (1, 2):
-            raise ValueError("Use a mono/stereo PCM WAV between 3 and 30 seconds.")
-    path = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(audio_bytes)
-            path = tmp.name
-        return extract_voice_features(path)
-    finally:
-        if path is not None:
-            os.unlink(path)
+def measure_wav(audio_bytes, include_metadata=False):
+    samples, sample_rate, info = decode_wav(audio_bytes)
+    measured = extract_voice_features(samples, sample_rate)
+    return (measured, info) if include_metadata else measured
 
 
 def match_voice_features(csv_bytes, filenames):
@@ -1136,7 +1161,6 @@ def match_voice_features(csv_bytes, filenames):
     if set(frame.recording_id) != set(filenames):
         raise ValueError("CSV recording_id values must match exactly the current uploaded/recorded audio files.")
     return frame.set_index("recording_id").loc[filenames, ACOUSTIC_FEATURES]
-
 
 
 # ══════════════════════════════════════════════
@@ -1161,7 +1185,7 @@ with tab6:
     with col_upload:
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
         st.markdown("**📂 Upload WAV File(s)**")
-        st.caption("Upload one or more pre-recorded .wav voice files")
+        st.caption("PCM or IEEE-float WAV, including WAVEX · 1–30 seconds · 16–96 kHz · mono/stereo · up to 20 MB each")
         v_files = st.file_uploader("wav files", type=["wav"],
                                    accept_multiple_files=True,
                                    label_visibility="collapsed",
@@ -1215,6 +1239,7 @@ with tab6:
     if v_recorded:
         recordings.append(("live_recording.wav", v_recorded))
     signature = hashlib.sha256()
+    signature.update(b"wav-decoder-soundfile-v2")
     signature.update(model_bundle["metadata"]["dataset_sha256"].encode())
     for filename, content in recordings:
         signature.update(filename.encode()); signature.update(content)
@@ -1229,7 +1254,14 @@ with tab6:
         st.session_state.pop("voice_result", None)
         try:
             with st.spinner("Analyzing voice…"):
-                measured = [measure_wav(content) for _, content in recordings]
+                measured, audio_info = [], []
+                for filename, content in recordings:
+                    try:
+                        descriptors, info = measure_wav(content, include_metadata=True)
+                    except (ValueError, RuntimeError) as exc:
+                        raise ValueError(f"{filename}: {exc}") from exc
+                    measured.append(descriptors)
+                    audio_info.append(info)
                 matched = None
                 scores = None
                 if feature_file is not None:
@@ -1238,11 +1270,16 @@ with tab6:
                     matched = match_voice_features(feature_file.getvalue(), [name for name, _ in recordings])
                     scores, outside = predict_input(model_bundle, matched)
                 st.session_state.voice_result = {"measured": measured, "matched": matched,
-                    "scores": scores, "names": [name for name, _ in recordings]}
+                    "scores": scores, "names": [name for name, _ in recordings], "audio_info": audio_info}
         except Exception as exc:
             st.error(f"Recording or feature validation failed: {exc}")
     if "voice_result" in st.session_state:
         result = st.session_state.voice_result
+        for filename, info in zip(result["names"], result.get("audio_info", [])):
+            st.caption(f"{filename}: {info['duration_seconds']:.2f} s · {info['sample_rate_hz']} Hz · "
+                       f"{info['channels']} channel(s) · {info['format']} / {info['subtype']}")
+            for message in info["warnings"]:
+                st.warning(f"{filename}: {message}")
         measured_table = pd.DataFrame(result["measured"], index=result["names"])
         st.dataframe(measured_table.rename_axis("Recording"))
         st.caption("These four Praat descriptors are measured from audio and shown for quality review. "
