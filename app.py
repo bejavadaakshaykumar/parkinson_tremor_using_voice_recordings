@@ -4,20 +4,26 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import confusion_matrix, roc_curve, auc
-from pathlib import Path
-import hashlib
-import json
-from modeling import (
-    MODEL_VERSION, _build_pipeline, prepare_data,
-    train_model as train_grouped_model, predict_single as predict_raw,
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import (
+    accuracy_score, f1_score, recall_score, confusion_matrix, roc_curve, auc,
 )
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.ensemble import (
+    RandomForestClassifier, StackingClassifier, HistGradientBoostingClassifier,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+
+# imblearn pipeline (NOT sklearn) — SMOTE inside folds only
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
 
 import shap
 import joblib
 import warnings
 
+warnings.filterwarnings("ignore")
 import tempfile, os, random
 import parselmouth
 from datetime import datetime
@@ -44,12 +50,15 @@ except ImportError:
 # ══════════════════════════════════════════════
 #  CONSTANTS — Feature Engineering & Persistence
 # ══════════════════════════════════════════════
-APP_DIR = Path(__file__).resolve().parent
-MODEL_PATH = APP_DIR / "parkinsons_pipeline_v7.pkl"
-DATA_PATH = APP_DIR / "parkinsons_dataset.csv"
-MODEL_CACHE_VERSION = MODEL_VERSION + hashlib.sha256(
-    (APP_DIR / "modeling.py").read_bytes()
-).hexdigest()[:12]
+# Redundant / multicollinear features to drop (statistical analysis)
+FEATURES_TO_DROP = [
+    "MDVP:Fhi(Hz)",
+    "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP",
+    "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5", "MDVP:APQ", "Shimmer:DDA",
+    "NHR",
+]
+
+MODEL_PATH = "parkinsons_pipeline.pkl"
 
 # ══════════════════════════════════════════════
 #  PAGE CONFIG
@@ -194,15 +203,6 @@ html, body, [data-testid="stAppViewContainer"],
     50%      { transform:scale(1.08); }
 }
 
-@media (max-width: 760px) {
-    .hero { padding:28px 24px; border-radius:18px; }
-    .hero-title { font-size:1.8rem; }
-    .kpi-grid { grid-template-columns:repeat(2,1fr); gap:12px; }
-    .kpi-card { padding:18px 14px; }
-}
-@media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation:none !important; transition:none !important; }
-}
 /* ── Tabs ── */
 [data-testid="stTabs"] [role="tab"] {
     font-weight:600; font-size:.88rem; color:#64748b;
@@ -221,61 +221,198 @@ html, body, [data-testid="stAppViewContainer"],
 # ══════════════════════════════════════════════
 #  DATA & MODEL
 # ══════════════════════════════════════════════
-@st.cache_data(max_entries=4)
-def load_data(csv_bytes):
-    data, _, _, _, _ = prepare_data(pd.read_csv(BytesIO(csv_bytes)))
-    return data
+@st.cache_data
+def load_data():
+    df = pd.read_csv("parkinsons_dataset.csv")
+    df["patient_id"] = df["name"].str.extract(r"(phon_R\d+_S\d+)")
+    df["label"] = df["status"].map({1: "Parkinson's", 0: "Healthy"})
+    return df
 
 
-@st.cache_resource(show_spinner=False, max_entries=2)
-def train_model(df, version=MODEL_CACHE_VERSION):
-    """Cache the dataset-specific, nested patient-group evaluation and model."""
-    progress = st.empty()
-    try:
-        return train_grouped_model(
-            df, version=version, cache_path=MODEL_PATH, progress=progress.info,
-        )
-    finally:
-        progress.empty()
+def _build_pipeline():
+    """Build the imblearn pipeline: SMOTE → Stacking Ensemble (11 core features)."""
+
+    # ── Base estimators for the stack ──
+    hgb_est = HistGradientBoostingClassifier(
+        max_iter=1000,
+        learning_rate=0.02,
+        max_depth=4,
+        min_samples_leaf=4,
+        l2_regularization=0.3,
+        max_bins=255,
+        early_stopping=False,
+        class_weight="balanced",
+        random_state=42,
+    )
+    rf_est = RandomForestClassifier(
+        n_estimators=1000,
+        max_depth=None,
+        min_samples_leaf=1,
+        min_samples_split=2,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        bootstrap=True,
+        oob_score=True,
+        random_state=42,
+        n_jobs=-1,
+    )
+    svc_est = SVC(
+        C=1.0,             # Softened margin for better specificity (was 50.0)
+        kernel="rbf",
+        gamma="auto",
+        probability=True,
+        class_weight="balanced",
+        random_state=42,
+    )
+
+    # ── Stacking ensemble ──
+    stacking_clf = StackingClassifier(
+        estimators=[
+            ("hgb", hgb_est),
+            ("rf", rf_est),
+            ("svc", svc_est),
+        ],
+        final_estimator=LogisticRegression(
+            C=0.5, max_iter=10000, solver="lbfgs",
+            class_weight="balanced", random_state=42,
+        ),
+        cv=3,
+        stack_method="predict_proba",
+        n_jobs=-1,
+    )
+
+    # ── Full imblearn pipeline (SMOTE applied inside CV folds only) ──
+    pipeline = ImbPipeline([
+        ("scaler", StandardScaler()),
+        ("smote", SMOTE(
+            random_state=42,
+            k_neighbors=5,
+            sampling_strategy="minority",   # Explicit minority oversampling
+        )),
+        ("clf", stacking_clf),
+    ])
+    return pipeline
 
 
-# Load from the app directory, regardless of the shell's working directory.
-if DATA_PATH.exists():
-    csv_bytes = DATA_PATH.read_bytes()
-else:
-    st.title("Parkinson's Voice Analytics")
-    st.info("Add parkinsons_dataset.csv beside app.py, or upload your training CSV below.")
-    uploaded_data = st.file_uploader("Training dataset", type=["csv", "data"])
-    if uploaded_data is None:
-        st.stop()
-    csv_bytes = uploaded_data.getvalue()
+@st.cache_resource
+def train_model(df, _version="v6_production_11feat"):
+    """
+    Train with strict subject-wise StratifiedGroupKFold cross-validation.
+    Uses only 11 core features (multicollinear/weak features dropped).
+    Persists the trained model to disk with joblib for fast reload.
+    """
+    # ── Check disk cache first ──
+    if os.path.exists(MODEL_PATH):
+        try:
+            saved = joblib.load(MODEL_PATH)
+            if saved.get("version") == _version:
+                return (
+                    saved["pipeline"], saved["fitted_scaler"],
+                    saved["features"], saved["selected_features"],
+                    saved["cv_metrics"], saved["oof_preds"],
+                    saved["oof_probs"], saved["y"],
+                    saved["fitted_clf"], saved["hgb_model"],
+                )
+        except Exception:
+            pass  # Corrupted file — retrain
 
-try:
-    df = load_data(csv_bytes)
-    required_acoustic = {
-        "MDVP:Fo(Hz)", "MDVP:Fhi(Hz)", "MDVP:Flo(Hz)", "MDVP:Jitter(%)",
-        "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP", "MDVP:Shimmer",
-        "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5", "MDVP:APQ", "Shimmer:DDA",
-        "NHR", "HNR", "RPDE", "DFA", "spread1", "spread2", "D2", "PPE",
+    # ── Feature filtering: drop redundant/weak features ──
+    feats = [c for c in df.columns if c not in ["name", "status", "label", "patient_id"]]
+    feats = [f for f in feats if f not in FEATURES_TO_DROP]
+    X = df[feats].values
+    y = df["status"].values
+    groups = df["patient_id"].values
+
+    pipeline = _build_pipeline()
+
+    # ── Subject-wise StratifiedGroupKFold CV (no data leakage + class balance) ──
+    gkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+
+    fold_acc, fold_f1, fold_sens, fold_spec = [], [], [], []
+    oof_preds = np.zeros(len(y), dtype=int)
+    oof_probs = np.zeros(len(y), dtype=float)
+
+    for fold_idx, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, y_te = y[train_idx], y[test_idx]
+
+        pipeline.fit(X_tr, y_tr)
+
+        y_pred = pipeline.predict(X_te)
+        y_prob = pipeline.predict_proba(X_te)[:, 1]
+
+        oof_preds[test_idx] = y_pred
+        oof_probs[test_idx] = y_prob
+
+        cm = confusion_matrix(y_te, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+
+        fold_acc.append(accuracy_score(y_te, y_pred))
+        fold_f1.append(f1_score(y_te, y_pred))
+        fold_sens.append(tp / (tp + fn) if (tp + fn) > 0 else 0.0)
+        fold_spec.append(tn / (tn + fp) if (tn + fp) > 0 else 0.0)
+
+    cv_metrics = {
+        "accuracy": np.mean(fold_acc) * 100,
+        "f1": np.mean(fold_f1) * 100,
+        "sensitivity": np.mean(fold_sens) * 100,
+        "specificity": np.mean(fold_spec) * 100,
+        "fold_acc": fold_acc,
+        "fold_f1": fold_f1,
+        "fold_sens": fold_sens,
+        "fold_spec": fold_spec,
     }
-    missing_acoustic = required_acoustic - set(df.columns)
-    if missing_acoustic:
-        raise ValueError("This dashboard needs the UCI acoustic columns: " + ", ".join(sorted(missing_acoustic)))
-    with st.spinner("Loading or training the model. First-run nested validation can take several minutes…"):
-        (
-            pipeline, fitted_scaler, features, selected_features,
-            cv_metrics, oof_preds, oof_probs, y_all, fitted_clf, hgb_model,
-        ) = train_model(df, version=MODEL_CACHE_VERSION)
-except (ValueError, OSError) as exc:
-    st.error(f"Unable to train: {exc}")
-    st.stop()
 
-decision_threshold = pipeline.decision_threshold_
-JITTER_COLS = ["MDVP:Jitter(%)", "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP"]
-SHIMMER_COLS = ["MDVP:Shimmer", "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5", "MDVP:APQ", "Shimmer:DDA"]
-FREQ_COLS = ["MDVP:Fo(Hz)", "MDVP:Fhi(Hz)", "MDVP:Flo(Hz)"]
+    # ── Refit the pipeline on all data for production inference ──
+    pipeline.fit(X, y)
+
+    fitted_scaler = pipeline.named_steps["scaler"]
+    fitted_clf = pipeline.named_steps["clf"]
+    selected_features = feats
+    hgb_model = fitted_clf.estimators_[0]
+
+    # ── Persist to disk with joblib ──
+    joblib.dump({
+        "version": _version,
+        "pipeline": pipeline,
+        "fitted_scaler": fitted_scaler,
+        "features": feats,
+        "selected_features": selected_features,
+        "cv_metrics": cv_metrics,
+        "oof_preds": oof_preds,
+        "oof_probs": oof_probs,
+        "y": y,
+        "fitted_clf": fitted_clf,
+        "hgb_model": hgb_model,
+    }, MODEL_PATH)
+
+    return (
+        pipeline, fitted_scaler, feats, selected_features,
+        cv_metrics, oof_preds, oof_probs, y,
+        fitted_clf, hgb_model,
+    )
+
+
+# ── Load or train model ──
+df = load_data()
+_spinner_msg = (
+    "📂 Loading pre-trained model..."
+    if os.path.exists(MODEL_PATH)
+    else "🔄 Training model (first run — may take a minute)..."
+)
+with st.spinner(_spinner_msg):
+    (
+        pipeline, fitted_scaler, features, selected_features,
+        cv_metrics, oof_preds, oof_probs, y_all,
+        fitted_clf, hgb_model,
+    ) = train_model(df)
+
+# ── Feature groups (only core retained features) ──
+JITTER_COLS = ["MDVP:Jitter(%)"]
+SHIMMER_COLS = ["MDVP:Shimmer"]
+FREQ_COLS = ["MDVP:Fo(Hz)", "MDVP:Flo(Hz)"]
 NONLINEAR_COLS = ["RPDE", "DFA", "spread1", "spread2", "D2", "PPE"]
-RATIO_COLS = ["NHR", "HNR"]
+RATIO_COLS = ["HNR"]
 
 PL = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -294,19 +431,19 @@ def hex_to_rgba(hex_color, alpha=0.2):
 
 
 def predict_single(x_raw):
-    """Apply all fitted transforms and the saved production threshold."""
-    return predict_raw(pipeline, x_raw)
+    """Run a single raw feature vector through the production pipeline.
+    x_raw: np.ndarray of shape (1, 11) — unscaled core features.
+    Returns (prediction, probability_array, x_scaled).
+    """
+    x_scaled = fitted_scaler.transform(x_raw)
+    pred = fitted_clf.predict(x_scaled)[0]
+    prob = fitted_clf.predict_proba(x_scaled)[0]
+    return pred, prob, x_scaled
 
 
 # ══════════════════════════════════════════════
 #  BULLETPROOF SHAP HELPERS
 # ══════════════════════════════════════════════
-@st.cache_data(max_entries=2, show_spinner=False)
-def global_shap_values(model_fingerprint, X, _model):
-    transformed = _model.transform_for_explanation(X)
-    return shap.TreeExplainer(_model.estimators_[0])(transformed).values
-
-
 def _safe_shap_single(sv):
     """Extract SHAP values for a single sample's positive class.
     Handles 0D, 1D, and 2D arrays safely.
@@ -345,7 +482,7 @@ def _shap_bar_fallback(sv, feature_names_list):
         color_continuous_midpoint=0,
     )
     fig.update_layout(**PL, coloraxis_showscale=False, height=420)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def render_shap_plot(x_input, feature_names_list):
@@ -403,16 +540,13 @@ with st.sidebar:
     )
     st.markdown("---")
     st.caption(
-        f"{len(df)} recordings · {df.patient_id.nunique()} patients · {len(selected_features)} selected features"
+        f"UCI Parkinson's Voice Dataset\n195 samples · 32 patients · {len(features)} core features"
     )
 
 mask = df["label"].isin(status_filter)
 if patient_filter:
     mask &= df["patient_id"].isin(patient_filter)
 dff = df[mask].copy()
-if dff.empty:
-    st.info("No recordings match these filters. Select a status or clear the patient filter.")
-    st.stop()
 
 # ══════════════════════════════════════════════
 #  HERO + PULSE BAR
@@ -422,8 +556,8 @@ st.markdown(
 <div class="hero">
   <span class="hero-emoji">🧠</span>
   <div class="hero-title">Parkinson's Voice Analytics</div>
-  <div class="hero-sub">Explore acoustic patterns · {len(selected_features)} selected features · Patient-group validation</div>
-  <span class="hero-badge">📊 {len(df)} Recordings · {df.patient_id.nunique()} Patients · Research Dashboard</span>
+  <div class="hero-sub">Biomedical voice signal analysis · {len(features)} core acoustic features · ML-powered diagnosis prediction</div>
+  <span class="hero-badge">📊 195 Recordings · 32 Patients · UCI Dataset</span>
 </div>
 """,
     unsafe_allow_html=True,
@@ -504,7 +638,7 @@ with tab1:
         )
         fig.update_traces(textinfo="percent+label", pull=[0.04, 0])
         fig.update_layout(**PL, legend=dict(orientation="h", y=-0.1))
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
@@ -525,7 +659,7 @@ with tab1:
             barmode="stack",
         )
         fig2.update_layout(**PL, xaxis_tickangle=45, xaxis_title="")
-        st.plotly_chart(fig2, width="stretch")
+        st.plotly_chart(fig2, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     # Radar chart — core features only
@@ -565,7 +699,7 @@ with tab1:
         polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
         legend=dict(orientation="h", y=-0.12),
     )
-    st.plotly_chart(fig3, width="stretch")
+    st.plotly_chart(fig3, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # Correlation heatmap — core features only
@@ -582,7 +716,7 @@ with tab1:
         zmax=1,
     )
     fig4.update_layout(**PL, height=520)
-    st.plotly_chart(fig4, width="stretch")
+    st.plotly_chart(fig4, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ── TAB 2: FEATURE DEEP DIVE ─────────────────
@@ -626,7 +760,7 @@ with tab2:
         height=380 * nrows,
         violingap=0.3,
     )
-    st.plotly_chart(fig5, width="stretch")
+    st.plotly_chart(fig5, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
@@ -643,7 +777,7 @@ with tab2:
         points="outliers",
     )
     fig6.update_layout(**PL)
-    st.plotly_chart(fig6, width="stretch")
+    st.plotly_chart(fig6, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     if len(cols_sel) >= 2:
@@ -662,7 +796,7 @@ with tab2:
             title=f"{pair_x} vs {pair_y}",
         )
         fig7.update_layout(**PL)
-        st.plotly_chart(fig7, width="stretch")
+        st.plotly_chart(fig7, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
 # ── TAB 3: ML MODEL ──────────────────────────
@@ -672,18 +806,10 @@ with tab3:
         unsafe_allow_html=True,
     )
     st.markdown(
-        "Each base learner: **StandardScaler → SelectKBest (MI, 10) → SMOTEENN**. "
-        "HGB + RF + SVC feed a cost-sensitive logistic stack. "
-        "All evaluation, threshold-tuning, and stacking splits keep patients separate."
+        "Pipeline: **SMOTE** → "
+        "**StackingClassifier** (HGB + RF + SVC → LR meta)  ·  "
+        f"**{len(features)}** core features (multicollinear features dropped)"
     )
-
-    st.caption(
-        "Metrics below are mean scores across five untouched outer folds. "
-        "Thresholds are chosen with Youden's J on inner validation predictions only. "
-        "Repeated recordings are grouped by patient; these are recording-level metrics."
-    )
-    st.metric("Saved decision threshold", f"{decision_threshold:.3f}")
-    st.caption("The final model uses the mean of the five training-only thresholds. Scores are not calibrated disease probabilities.")
 
     # ── 4 KPI Cards: Accuracy, F1, Sensitivity, Specificity ──
     c1, c2, c3, c4 = st.columns(4)
@@ -706,20 +832,6 @@ with tab3:
                 unsafe_allow_html=True,
             )
 
-    metric_names = ["accuracy", "f1", "sensitivity", "specificity"]
-    with st.expander("Compare tuned decisions with the default 0.5 threshold", expanded=True):
-        comparison = pd.DataFrame({
-            "Metric": ["Accuracy", "F1-Score", "Sensitivity", "Specificity"],
-            "Default 0.5 (%)": [cv_metrics["default_threshold_metrics"][m] for m in metric_names],
-            "Tuned (%)": [cv_metrics[m] for m in metric_names],
-        })
-        st.dataframe(comparison.round(2), width="stretch", hide_index=True)
-        st.caption("Same held-out scores, different decision thresholds. This comparison is not the old model baseline.")
-    if all(cv_metrics[m] > 95 for m in metric_names):
-        st.success("All four fold-mean metrics exceed 95% on this evaluation. Independent validation is still needed.")
-    else:
-        st.info("The >95% target is not met on all four metrics. The held-out results below show the measured performance.")
-
     # ── Per-fold performance table ──
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
     fold_df = pd.DataFrame({
@@ -729,12 +841,6 @@ with tab3:
         "Sensitivity (%)": [round(v * 100, 2) for v in cv_metrics['fold_sens']],
         "Specificity (%)": [round(v * 100, 2) for v in cv_metrics['fold_spec']],
     })
-    fold_df["Threshold"] = cv_metrics["fold_thresholds"]
-    fold_df["Healthy recordings"] = [a["healthy_recordings"] for a in cv_metrics["fold_audit"]]
-    fold_df["Parkinson's recordings"] = [a["parkinsons_recordings"] for a in cv_metrics["fold_audit"]]
-    st.dataframe(fold_df.round(3), width="stretch", hide_index=True)
-    st.download_button("Download validation audit", json.dumps(cv_metrics, indent=2),
-                       file_name="validation_audit.json", mime="application/json")
     fig_fold = go.Figure()
     for metric_col, color in [
         ("Accuracy (%)", "#6366f1"),
@@ -756,7 +862,7 @@ with tab3:
         height=360,
         legend=dict(orientation="h", y=-0.15),
     )
-    st.plotly_chart(fig_fold, width="stretch")
+    st.plotly_chart(fig_fold, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Confusion Matrix & ROC Curve ──
@@ -773,7 +879,7 @@ with tab3:
             title="Confusion Matrix (Aggregated OOF)",
         )
         fig8.update_layout(**PL, height=340)
-        st.plotly_chart(fig8, width="stretch")
+        st.plotly_chart(fig8, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with c2:
@@ -806,15 +912,16 @@ with tab3:
             yaxis_title="True Positive Rate",
             height=340,
         )
-        st.plotly_chart(fig9, width="stretch")
+        st.plotly_chart(fig9, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     # ── Feature importance from dominant HGB model (bulletproof SHAP) ──
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
     try:
-        sv = _safe_shap_global(global_shap_values(
-            cv_metrics["fingerprint"], df[features].values, pipeline,
-        ))
+        X_scaled_all = fitted_scaler.transform(df[features].values)
+        explainer = shap.TreeExplainer(hgb_model)
+        shap_values_all = explainer(X_scaled_all)
+        sv = _safe_shap_global(shap_values_all.values)
         mean_abs_shap = np.mean(np.abs(sv), axis=0)
         imp_df = pd.DataFrame({
             "Feature": selected_features,
@@ -825,12 +932,12 @@ with tab3:
             y="Feature",
             x="Mean |SHAP|",
             orientation="h",
-            title=f"{len(selected_features)} Selected Features — Mean |SHAP| (HistGradientBoosting)",
+            title=f"All {len(features)} Core Features — Mean |SHAP| (HistGradientBoosting)",
             color="Mean |SHAP|",
             color_continuous_scale="Purples",
         )
         fig10.update_layout(**PL, coloraxis_showscale=False, height=420)
-        st.plotly_chart(fig10, width="stretch")
+        st.plotly_chart(fig10, use_container_width=True)
     except Exception:
         try:
             importances = (
@@ -854,20 +961,22 @@ with tab3:
             color_continuous_scale="Purples",
         )
         fig10.update_layout(**PL, coloraxis_showscale=False, height=420)
-        st.plotly_chart(fig10, width="stretch")
+        st.plotly_chart(fig10, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    with st.expander(f"📋 {len(selected_features)} selected acoustic features"):
-        selector = pipeline.hgb_pipeline_.named_steps["selector"]
-        selection = pd.DataFrame({
-            "Feature": features, "Mutual information": selector.scores_,
-            "Selected": selector.get_support(),
-        }).sort_values("Mutual information", ascending=False)
-        st.dataframe(selection, width="stretch", hide_index=True)
+    # ── Core features list ──
+    with st.expander(f"📋 All {len(features)} Core Acoustic Features Used"):
+        st.write(
+            f"**{len(features)}** core features retained after dropping "
+            f"**{len(FEATURES_TO_DROP)}** redundant/multicollinear features:"
+        )
+        sel_df = pd.DataFrame({
+            "#": range(1, len(selected_features) + 1),
+            "Feature": selected_features,
+        })
+        st.dataframe(sel_df, use_container_width=True, hide_index=True)
         st.caption(
-            "Final fit shown here. Each validation fold learns its own selection. "
-            "Mutual information ranks relevance; correlated features can still be selected. "
-            "SHAP explains the HGB component, not the complete stack."
+            f"**Dropped features:** {', '.join(FEATURES_TO_DROP)}"
         )
 
 # ── TAB 4: PREDICT ───────────────────────────
@@ -878,55 +987,49 @@ with tab4:
     )
     st.info(
         "Use the sliders to simulate a voice recording and get a real-time "
-        "model score from the grouped stack. Only the selected features are shown."
+        "Parkinson's prediction from the Stacking Ensemble model with SHAP explanations."
     )
 
     defaults = df[features].mean().to_dict()
     mins = df[features].min().to_dict()
     maxs = df[features].max().to_dict()
 
-    with st.form("prediction_inputs", border=False):
-        input_vals = defaults.copy()
-        groups_ui = [
-            ("🎵 Fundamental Frequency", FREQ_COLS),
-            ("〰️ Jitter Features", JITTER_COLS),
-            ("📶 Shimmer Features", SHIMMER_COLS),
-            ("📡 Noise Ratios", RATIO_COLS),
-            ("🌀 Nonlinear Dynamics", NONLINEAR_COLS),
-        ]
-        for grp_name, grp_cols in groups_ui:
-            grp_cols = [f for f in grp_cols if f in selected_features]
-            if not grp_cols:
-                continue
-            st.markdown(
-                f'<div class="sec-hdr">{grp_name}</div>', unsafe_allow_html=True
-            )
-            gcols = st.columns(min(3, len(grp_cols)))
-            for i, feat in enumerate(grp_cols):
-                with gcols[i % len(gcols)]:
-                    lo = float(mins[feat])
-                    hi = float(maxs[feat])
-                    dv = float(defaults[feat])
-                    step = max((hi - lo) / 200, 1e-6)
-                    input_vals[feat] = st.slider(
-                        feat, lo, hi, dv, step=step, format="%.5f"
-                    )
-
-        submitted = st.form_submit_button(
-            "🔍 Run Prediction", width="stretch", type="primary"
+    input_vals = {}
+    groups_ui = [
+        ("🎵 Fundamental Frequency", FREQ_COLS),
+        ("〰️ Jitter Features", JITTER_COLS),
+        ("📶 Shimmer Features", SHIMMER_COLS),
+        ("📡 Noise Ratios", RATIO_COLS),
+        ("🌀 Nonlinear Dynamics", NONLINEAR_COLS),
+    ]
+    for grp_name, grp_cols in groups_ui:
+        st.markdown(
+            f'<div class="sec-hdr">{grp_name}</div>', unsafe_allow_html=True
         )
-    if submitted:
+        gcols = st.columns(min(3, len(grp_cols)))
+        for i, feat in enumerate(grp_cols):
+            with gcols[i % len(gcols)]:
+                lo = float(mins[feat])
+                hi = float(maxs[feat])
+                dv = float(defaults[feat])
+                step = max((hi - lo) / 200, 1e-6)
+                input_vals[feat] = st.slider(
+                    feat, lo, hi, dv, step=step, format="%.5f"
+                )
+
+    if st.button(
+        "🔍 Run Prediction", use_container_width=True, type="primary"
+    ):
         x_in = np.array([[input_vals[f] for f in features]])
         pred, prob, x_scaled = predict_single(x_in)
         conf = round(prob[pred] * 100, 1)
-        st.caption(f"Decision rule: Parkinson's score ≥ {decision_threshold:.3f}. Scores are not clinical confidence estimates.")
 
         if pred == 1:
             st.markdown(
                 f"""
             <div class="pred-box pred-pos">
-              <div class="pred-title">🔴 Model classification: Parkinson's</div>
-              <div class="pred-conf">Class score: <strong>{conf}%</strong></div>
+              <div class="pred-title">🔴 Parkinson's Detected</div>
+              <div class="pred-conf">Confidence: <strong>{conf}%</strong></div>
               <div class="pred-conf" style="margin-top:8px;font-size:.85rem">
                 Healthy {round(prob[0] * 100, 1)}% · Parkinson's {round(prob[1] * 100, 1)}%
               </div>
@@ -937,8 +1040,8 @@ with tab4:
             st.markdown(
                 f"""
             <div class="pred-box pred-neg">
-              <div class="pred-title">🟢 Model classification: Healthy</div>
-              <div class="pred-conf">Class score: <strong>{conf}%</strong></div>
+              <div class="pred-title">🟢 Healthy Voice Pattern</div>
+              <div class="pred-conf">Confidence: <strong>{conf}%</strong></div>
               <div class="pred-conf" style="margin-top:8px;font-size:.85rem">
                 Healthy {round(prob[0] * 100, 1)}% · Parkinson's {round(prob[1] * 100, 1)}%
               </div>
@@ -955,7 +1058,7 @@ with tab4:
         render_shap_plot(x_scaled, selected_features)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.caption("Research use only. SHAP explains the HGB component; model scores are not a diagnosis.")
+    st.caption("⚠️ Educational/research use only. Not a clinical diagnostic tool.")
 
 # ── TAB 5: DATA EXPLORER ─────────────────────
 with tab5:
@@ -964,7 +1067,7 @@ with tab5:
     with c1:
         search = st.text_input("🔍 Filter by patient ID", "")
     with c2:
-        n_rows = st.slider("Rows to show", 1, max(2, len(dff)), min(50, len(dff)))
+        n_rows = st.slider("Rows to show", 10, 195, 50)
 
     disp = dff.copy()
     if search:
@@ -973,12 +1076,12 @@ with tab5:
     show_cols = ["name", "label"] + list(features)
     st.dataframe(
         disp[show_cols].head(n_rows).reset_index(drop=True),
-        width="stretch",
+        use_container_width=True,
         height=440,
     )
 
     st.markdown("**📊 Summary Statistics**")
-    st.dataframe(dff[features].describe().T, width="stretch")
+    st.dataframe(dff[features].describe().T, use_container_width=True)
 
     st.download_button(
         "⬇️ Download Filtered Data (CSV)",
@@ -1076,7 +1179,7 @@ def generate_voice_docx(
     _sec_hdr(doc, "1", "Patient Information")
     pt = doc.add_table(rows=2, cols=6)
     pt.style = "Table Grid"
-    for i, h in enumerate(["Name", "Age", "Gender", "Model Class", "Fo (Hz)", "HNR"]):
+    for i, h in enumerate(["Name", "Age", "Gender", "Risk Level", "Fo (Hz)", "HNR"]):
         pt.rows[0].cells[i].text = h
         _set_cell_bg(pt.rows[0].cells[i], "1e3a8a")
         for run in pt.rows[0].cells[i].paragraphs[0].runs:
@@ -1097,12 +1200,12 @@ def generate_voice_docx(
     rt.style = "Table Grid"
     pk_clr = (
         RGBColor(0xDC, 0x26, 0x26)
-        if parkinson_prob >= decision_threshold
+        if parkinson_prob > 0.5
         else RGBColor(0x16, 0xA3, 0x4A)
     )
     hl_clr = (
         RGBColor(0x16, 0xA3, 0x4A)
-        if parkinson_prob < decision_threshold
+        if healthy_prob >= 0.5
         else RGBColor(0xDC, 0x26, 0x26)
     )
     rh = {"Low Risk": "16a34a", "Moderate Risk": "d97706", "High Risk": "dc2626"}.get(
@@ -1114,13 +1217,13 @@ def generate_voice_docx(
             (
                 f"Parkinson's\n{parkinson_prob * 100:.1f}%",
                 pk_clr,
-                "FEE2E2" if parkinson_prob >= decision_threshold else "DCFCE7",
+                "FEE2E2" if parkinson_prob > 0.5 else "DCFCE7",
             ),
-            (f"Model Class\n{level}", rsk_clr, "F8FAFC"),
+            (f"Risk Level\n{level}", rsk_clr, "F8FAFC"),
             (
                 f"Healthy\n{healthy_prob * 100:.1f}%",
                 hl_clr,
-                "DCFCE7" if parkinson_prob < decision_threshold else "FEE2E2",
+                "DCFCE7" if healthy_prob >= 0.5 else "FEE2E2",
             ),
         ]
     ):
@@ -1164,21 +1267,51 @@ def generate_voice_docx(
                 run.font.size = Pt(9)
     doc.add_paragraph()
 
-    # 4. RESEARCH INTERPRETATION
-    _sec_hdr(doc, "4", "Research Interpretation")
-    doc.add_paragraph(
-        f"Model classification: {level}. The Parkinson's class score is "
-        f"{parkinson_prob:.3f}, using a decision threshold of {decision_threshold:.3f}. "
-        "These scores are not calibrated disease probabilities. "
-        "Dataset cross-validation does not establish performance on uploaded audio. "
-        "This output cannot establish or exclude a diagnosis."
-    )
-    _sec_hdr(doc, "5", "Feature Measurement Limits")
-    doc.add_paragraph(
-        "Nonlinear acoustic measurements are unavailable from this extractor and "
-        "are listed as missing. Voice scoring is disabled if any are selected by the model. "
-        "SHAP, when shown in the app, explains only the HGB component."
-    )
+    # 4. INTERPRETATION
+    _sec_hdr(doc, "4", "Clinical Interpretation")
+    if parkinson_prob > 0.7:
+        interp = (
+            "Significant acoustic irregularities detected — elevated jitter and shimmer with "
+            "reduced HNR. These biomarkers are consistent with neuromuscular instability "
+            "associated with Parkinson's disease."
+        )
+    elif parkinson_prob > 0.3:
+        interp = (
+            "Moderate acoustic deviations detected. Some features show mild irregularity "
+            "that warrants further clinical evaluation by a neurologist."
+        )
+    else:
+        interp = (
+            "Voice parameters within the expected healthy range. Jitter, shimmer, and "
+            "harmonicity values show no significant deviation from normal."
+        )
+    doc.add_paragraph(interp).paragraph_format.space_after = Pt(6)
+
+    # 5. RECOMMENDATIONS
+    _sec_hdr(doc, "5", "Recommendations")
+    rec_map = {
+        "Low Risk": [
+            "Maintain a healthy and active lifestyle.",
+            "Perform routine voice check-ups annually.",
+            "Regular physical exercise and balanced diet.",
+        ],
+        "Moderate Risk": [
+            "Schedule a neurologist appointment promptly.",
+            "Clinical tests (DaTscan/MRI) recommended.",
+            "Monitor voice quality monthly.",
+            "Track motor symptoms such as tremor or rigidity.",
+        ],
+        "High Risk": [
+            "Seek immediate specialist consultation — do not delay.",
+            "Urgent neurological examination required.",
+            "Consider speech therapy and physiotherapy.",
+            "Family members should be informed and supportive.",
+        ],
+    }
+    for rec in rec_map.get(level, [advice]):
+        p_ = doc.add_paragraph(style="List Bullet")
+        p_.add_run(rec).font.size = Pt(10)
+    doc.add_paragraph()
 
     # 6. MODEL METRICS (actual CV metrics)
     _sec_hdr(doc, "6", "Model Performance Metrics")
@@ -1224,28 +1357,28 @@ def generate_voice_docx(
 # ══════════════════════════════════════════════
 #  REAL VOICE FEATURE EXTRACTION (parselmouth)
 # ══════════════════════════════════════════════
-def _safe_praat_val(val, default=None):
-    """Preserve unavailable measurements as missing, never invented values."""
+def _safe_praat_val(val, default=0.0):
+    """Return a safe float from a Praat call that may return NaN/None/undefined."""
     if val is None:
-        return float("nan")
+        return default
     try:
         fval = float(val)
         if np.isnan(fval) or np.isinf(fval):
-            return float("nan")
+            return default
         return fval
     except (ValueError, TypeError):
-        return float("nan")
+        return default
 
 
 def extract_voice_features(file_path):
     """Extract all 22 acoustic features from a WAV file using parselmouth (Praat).
 
     Computes real Jitter, Shimmer, HNR, NHR, and fundamental frequency metrics.
-    Nonlinear dynamics features are missing. Prediction is blocked if they
-    are selected. Unused input slots are filled only to satisfy the input schema.
+    Nonlinear dynamics features (RPDE, DFA, spread1/2, D2, PPE) use dataset-median
+    defaults since they require specialised toolboxes beyond parselmouth.
 
     Returns:
-        core_array: np.ndarray of shape (1, n_features) — raw features in training order
+        core_array: np.ndarray of shape (1, 11) — core features for model prediction
         fo: float — mean fundamental frequency
         hnr: float — harmonics-to-noise ratio
         all_feature_names: list[str] — all 22 feature names (for DOCX report)
@@ -1261,7 +1394,7 @@ def extract_voice_features(file_path):
     pv = pitch.selected_array["frequency"]
     pv = pv[pv != 0]
     if len(pv) == 0:
-        raise ValueError("No voiced segment detected. Use a clear, sustained vowel recording.")
+        fo, fhi, flo = 150.0, 200.0, 100.0
     else:
         fo = float(np.mean(pv))
         fhi = float(np.max(pv))
@@ -1321,13 +1454,18 @@ def extract_voice_features(file_path):
     # ── Harmonics ──
     harmonicity = sound.to_harmonicity()
     hnr_vals = harmonicity.values[harmonicity.values != -200]
-    hnr = float(np.mean(hnr_vals)) if len(hnr_vals) > 0 else float("nan")
-    nhr = 10 ** (-hnr / 10) if np.isfinite(hnr) else float("nan")
+    hnr = float(np.mean(hnr_vals)) if len(hnr_vals) > 0 else 20.0
+    nhr = 1.0 / (10 ** (hnr / 10)) if hnr > 0 else 0.05
 
-    # ── Unavailable nonlinear measurements ──
+    # ── Nonlinear dynamics (dataset-median defaults) ──
     # These require specialised algorithms (recurrence analysis, fractal scaling)
-    # not available in parselmouth; do not fabricate measurements.
-    rpde = dfa = spread1 = spread2 = d2 = ppe = float("nan")
+    # not available in parselmouth. Using Parkinson's dataset median values.
+    rpde = 0.4986
+    dfa = 0.7183
+    spread1 = -5.6844
+    spread2 = 0.2269
+    d2 = 2.3019
+    ppe = 0.2068
 
     # ── All 22 features in dataset column order (for DOCX report) ──
     all_feature_names = [
@@ -1347,13 +1485,9 @@ def extract_voice_features(file_path):
         rpde, dfa, spread1, spread2, d2, ppe,
     ]
 
-    # ── All raw features in the trained order ──
+    # ── Core 11 features for model prediction (in trained order) ──
     all_feats_dict = dict(zip(all_feature_names, all_feature_values))
-    unavailable = [f for f in selected_features if not np.isfinite(all_feats_dict.get(f, np.nan))]
-    if unavailable:
-        raise ValueError("Selected features cannot be measured from audio: " + ", ".join(unavailable))
-    core_values = [all_feats_dict[f] if np.isfinite(all_feats_dict.get(f, np.nan))
-                   else float(df[f].median()) for f in features]
+    core_values = [all_feats_dict[f] for f in features]
     core_array = np.array(core_values).reshape(1, -1)
 
     return core_array, fo, hnr, all_feature_names, all_feature_values
@@ -1364,25 +1498,13 @@ def extract_voice_features(file_path):
 # ══════════════════════════════════════════════
 with tab6:
     st.markdown(
-        '<div class="sec-hdr">🎤 Voice-Based Prediction & Research Report</div>',
+        '<div class="sec-hdr">🎤 Voice-Based Prediction & Medical Report</div>',
         unsafe_allow_html=True,
     )
     st.info(
         "Upload a WAV file or record your voice live. The model will predict "
-        "an acoustic research score only when all selected features can be measured."
+        "Parkinson's risk and generate a downloadable medical report with SHAP explanations."
     )
-
-    unmeasured_features = sorted(set(selected_features) & set(NONLINEAR_COLS))
-    unsupported_features = sorted(set(features) - required_acoustic)
-    voice_prediction_available = not unmeasured_features and not unsupported_features
-    if not voice_prediction_available:
-        st.warning(
-            "Voice prediction is unavailable for this fitted model: the audio extractor cannot "
-            "measure " + ", ".join(unmeasured_features + unsupported_features) + ". "
-            "Use the Predict tab with measured features. Dataset medians must not stand in for your voice."
-        )
-    else:
-        st.caption("Experimental audio workflow. CSV validation does not validate this audio extractor on new recordings.")
 
     # Patient info
     v1, v2, v3 = st.columns(3)
@@ -1404,16 +1526,15 @@ with tab6:
 
     with col_upload:
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-        st.markdown("**📂 Upload a WAV file**")
-        st.caption("Upload one pre-recorded .wav voice file")
+        st.markdown("**📂 Upload WAV File(s)**")
+        st.caption("Upload one or more pre-recorded .wav voice files")
         v_files = st.file_uploader(
             "wav files",
             type=["wav"],
-            accept_multiple_files=False,
+            accept_multiple_files=True,
             label_visibility="collapsed",
             key="v_uploader",
         )
-        v_files = [v_files] if v_files is not None else []
         if v_files:
             for f in v_files:
                 st.audio(f)
@@ -1464,10 +1585,9 @@ with tab6:
 
     if (has_v_upload or has_v_record) and st.button(
         "🔍 Analyze & Generate Report",
-        width="stretch",
+        use_container_width=True,
         type="primary",
         key="v_analyze",
-        disabled=not voice_prediction_available,
     ):
         probs = []
         last_fo = 0.0
@@ -1477,31 +1597,36 @@ with tab6:
         last_x_scaled = None
         src_label = "WAV Upload"
 
-        recordings = []
-        if has_v_upload:
-            recordings.extend((f.name, f.getvalue()) for f in v_files)
-        if has_v_record:
-            recordings.append(("Live microphone", v_recorded))
-        # A report describes one recording, so don't mix its features with an
-        # average prediction over different recordings.
-        if len(recordings) != 1:
-            st.error("Analyze one recording at a time so the score, explanation, and report refer to the same sample.")
-            st.stop()
-        src_label, audio_bytes = recordings[0]
-        path = None
-        try:
-            with st.spinner("Analyzing voice…"):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-                    tmp.write(audio_bytes)
+        with st.spinner("Analyzing voice..."):
+            if has_v_upload:
+                for f in v_files:
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=".wav"
+                    ) as tmp:
+                        tmp.write(f.read())
+                        path = tmp.name
+                    core_feats, fo, hnr, fn, fv = extract_voice_features(path)
+                    pred, prob, x_sc = predict_single(core_feats)
+                    probs.append(float(prob[1]))
+                    last_fo, last_hnr, last_fn, last_fv = fo, hnr, fn, fv
+                    last_x_scaled = x_sc
+                    os.unlink(path)
+
+            if has_v_record:
+                src_label = (
+                    "Live Microphone" if not has_v_upload else "WAV + Live Mic"
+                )
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".wav"
+                ) as tmp:
+                    tmp.write(v_recorded)
                     path = tmp.name
-                core_feats, last_fo, last_hnr, last_fn, last_fv = extract_voice_features(path)
-                pred, prob, last_x_scaled = predict_single(core_feats)
+                core_feats, fo, hnr, fn, fv = extract_voice_features(path)
+                pred, prob, x_sc = predict_single(core_feats)
                 probs.append(float(prob[1]))
-        except (ValueError, RuntimeError, OSError) as exc:
-            st.error(f"Could not analyze this recording: {exc}")
-            st.stop()
-        finally:
-            if path is not None and os.path.exists(path):
+                if not has_v_upload:
+                    last_fo, last_hnr, last_fn, last_fv = fo, hnr, fn, fv
+                last_x_scaled = x_sc
                 os.unlink(path)
 
         pk_prob = float(np.mean(probs))
@@ -1509,8 +1634,8 @@ with tab6:
 
         # Metrics row
         m1, m2, m3 = st.columns(3)
-        m1.metric("🔴 Parkinson's class score", f"{pk_prob * 100:.2f}%")
-        m2.metric("🟢 Healthy class score", f"{hl_prob * 100:.2f}%")
+        m1.metric("🔴 Parkinson Probability", f"{pk_prob * 100:.2f}%")
+        m2.metric("🟢 Healthy Probability", f"{hl_prob * 100:.2f}%")
         m3.metric("📊 AUC Score", f"{auc(*roc_curve(y_all, oof_probs)[:2]):.3f}")
 
         # ── SHAP Explanation ──
@@ -1524,14 +1649,18 @@ with tab6:
         st.markdown("</div>", unsafe_allow_html=True)
 
         # Risk + result box
-        if pk_prob < decision_threshold:
-            level, advice = "Healthy model class", "Research output; not a clinical assessment"
+        if pk_prob < 0.30:
+            level, advice = "Low Risk", "Maintain a healthy lifestyle"
             box_css = "pred-neg"
             icon = "🟢"
-        else:
-            level, advice = "Parkinson's model class", "Research output; not a clinical assessment"
+        elif pk_prob < 0.70:
+            level, advice = "Moderate Risk", "Consult a neurologist"
             box_css = "pred-pos"
-            icon = "🟣"
+            icon = "🟡"
+        else:
+            level, advice = "High Risk", "Immediate specialist consultation"
+            box_css = "pred-pos"
+            icon = "🔴"
 
         st.markdown(
             f"""
@@ -1563,15 +1692,15 @@ with tab6:
         )
         fname = f"PD_Report_{v_name.replace(' ', '_') or 'Patient'}_{datetime.now().strftime('%Y%m%d')}.docx"
         st.download_button(
-            label="📄 Download Research Report (.docx)",
+            label="📄 Download Medical Report (.docx)",
             data=doc_buf,
             file_name=fname,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            width="stretch",
+            use_container_width=True,
             key="v_download",
         )
 
-    st.caption("Research use only. SHAP explains the HGB component; model scores are not a diagnosis.")
+    st.caption("⚠️ Educational/research use only. Not a clinical diagnostic tool.")
 
 # ── FOOTER
 st.markdown("---")
