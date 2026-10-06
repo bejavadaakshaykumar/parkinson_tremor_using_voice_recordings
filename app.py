@@ -8,19 +8,19 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import (
     accuracy_score, f1_score, recall_score, confusion_matrix, roc_curve, auc,
 )
-from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
+from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.ensemble import (
     RandomForestClassifier, StackingClassifier, HistGradientBoostingClassifier,
 )
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC, LinearSVC
-from sklearn.feature_selection import SelectFromModel
+from sklearn.svm import SVC
 
 # imblearn pipeline (NOT sklearn) — SMOTE inside folds only
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
 
 import shap
+import joblib
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -46,6 +46,19 @@ try:
     ST_SHAP_AVAILABLE = True
 except ImportError:
     ST_SHAP_AVAILABLE = False
+
+# ══════════════════════════════════════════════
+#  CONSTANTS — Feature Engineering & Persistence
+# ══════════════════════════════════════════════
+# Redundant / multicollinear features to drop (statistical analysis)
+FEATURES_TO_DROP = [
+    "MDVP:Fhi(Hz)",
+    "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP",
+    "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5", "MDVP:APQ", "Shimmer:DDA",
+    "NHR",
+]
+
+MODEL_PATH = "parkinsons_pipeline.pkl"
 
 # ══════════════════════════════════════════════
 #  PAGE CONFIG
@@ -217,37 +230,36 @@ def load_data():
 
 
 def _build_pipeline():
-    """Build the imblearn pipeline: SMOTE → L1 Feature Selection → Stacking Ensemble."""
-
-    # ── L1-regularised feature selector ──
-    l1_selector = SelectFromModel(
-        LinearSVC(C=0.04, penalty="l1", dual=False, max_iter=20000),
-        threshold="mean",
-    )
+    """Build the imblearn pipeline: SMOTE → Stacking Ensemble (11 core features)."""
 
     # ── Base estimators for the stack ──
-    xgb_est = HistGradientBoostingClassifier(
-        max_iter=500,
-        learning_rate=0.05,
-        max_depth=5,
-        min_samples_leaf=8,
-        l2_regularization=1.0,
-        max_bins=128,
+    hgb_est = HistGradientBoostingClassifier(
+        max_iter=1000,
+        learning_rate=0.02,
+        max_depth=4,
+        min_samples_leaf=4,
+        l2_regularization=0.3,
+        max_bins=255,
+        early_stopping=False,
+        class_weight="balanced",
         random_state=42,
     )
     rf_est = RandomForestClassifier(
-        n_estimators=500,
-        max_depth=12,
-        min_samples_leaf=3,
+        n_estimators=1000,
+        max_depth=None,
+        min_samples_leaf=1,
+        min_samples_split=2,
         max_features="sqrt",
-        class_weight="balanced",
+        class_weight="balanced_subsample",
+        bootstrap=True,
+        oob_score=True,
         random_state=42,
         n_jobs=-1,
     )
     svc_est = SVC(
-        C=10.0,
+        C=1.0,             # Softened margin for better specificity (was 50.0)
         kernel="rbf",
-        gamma="scale",
+        gamma="auto",
         probability=True,
         class_weight="balanced",
         random_state=42,
@@ -256,14 +268,15 @@ def _build_pipeline():
     # ── Stacking ensemble ──
     stacking_clf = StackingClassifier(
         estimators=[
-            ("hgb", xgb_est),
+            ("hgb", hgb_est),
             ("rf", rf_est),
             ("svc", svc_est),
         ],
         final_estimator=LogisticRegression(
-            C=1.0, max_iter=5000, solver="lbfgs", random_state=42,
+            C=0.5, max_iter=10000, solver="lbfgs",
+            class_weight="balanced", random_state=42,
         ),
-        cv=5,
+        cv=3,
         stack_method="predict_proba",
         n_jobs=-1,
     )
@@ -271,22 +284,41 @@ def _build_pipeline():
     # ── Full imblearn pipeline (SMOTE applied inside CV folds only) ──
     pipeline = ImbPipeline([
         ("scaler", StandardScaler()),
-        ("smote", SMOTE(random_state=42, k_neighbors=3)),
-        ("selector", l1_selector),
+        ("smote", SMOTE(
+            random_state=42,
+            k_neighbors=5,
+            sampling_strategy="minority",   # Explicit minority oversampling
+        )),
         ("clf", stacking_clf),
     ])
     return pipeline
 
 
 @st.cache_resource
-def train_model(df, _version="v3_stratified_groupkfold"):
+def train_model(df, _version="v6_production_11feat"):
     """
     Train with strict subject-wise StratifiedGroupKFold cross-validation.
-    Ensures both classes appear in every fold (no data leakage + stratification).
-    Returns: fitted pipeline, scaler, feature names, CV metrics dict,
-             out-of-fold predictions, and the dominant base model for SHAP.
+    Uses only 11 core features (multicollinear/weak features dropped).
+    Persists the trained model to disk with joblib for fast reload.
     """
+    # ── Check disk cache first ──
+    if os.path.exists(MODEL_PATH):
+        try:
+            saved = joblib.load(MODEL_PATH)
+            if saved.get("version") == _version:
+                return (
+                    saved["pipeline"], saved["fitted_scaler"],
+                    saved["features"], saved["selected_features"],
+                    saved["cv_metrics"], saved["oof_preds"],
+                    saved["oof_probs"], saved["y"],
+                    saved["fitted_clf"], saved["hgb_model"],
+                )
+        except Exception:
+            pass  # Corrupted file — retrain
+
+    # ── Feature filtering: drop redundant/weak features ──
     feats = [c for c in df.columns if c not in ["name", "status", "label", "patient_id"]]
+    feats = [f for f in feats if f not in FEATURES_TO_DROP]
     X = df[feats].values
     y = df["status"].values
     groups = df["patient_id"].values
@@ -334,44 +366,53 @@ def train_model(df, _version="v3_stratified_groupkfold"):
     # ── Refit the pipeline on all data for production inference ──
     pipeline.fit(X, y)
 
-    # ── Extract the fitted scaler for inference on new data ──
     fitted_scaler = pipeline.named_steps["scaler"]
-
-    # ── Build a standalone inference pipeline (no SMOTE at predict time) ──
-    # We need the selector's mask and the fitted classifier
-    fitted_selector = pipeline.named_steps["selector"]
     fitted_clf = pipeline.named_steps["clf"]
-    selected_mask = fitted_selector.get_support()
-    selected_features = [f for f, s in zip(feats, selected_mask) if s]
+    selected_features = feats
+    hgb_model = fitted_clf.estimators_[0]
 
-    # ── Extract the dominant base model (HistGradientBoosting) for SHAP ──
-    # After full refit, get the HGB from the stacking classifier
-    hgb_model = fitted_clf.estimators_[0]  # first base estimator = hgb
+    # ── Persist to disk with joblib ──
+    joblib.dump({
+        "version": _version,
+        "pipeline": pipeline,
+        "fitted_scaler": fitted_scaler,
+        "features": feats,
+        "selected_features": selected_features,
+        "cv_metrics": cv_metrics,
+        "oof_preds": oof_preds,
+        "oof_probs": oof_probs,
+        "y": y,
+        "fitted_clf": fitted_clf,
+        "hgb_model": hgb_model,
+    }, MODEL_PATH)
 
     return (
-        pipeline, fitted_scaler, feats, selected_features, selected_mask,
+        pipeline, fitted_scaler, feats, selected_features,
         cv_metrics, oof_preds, oof_probs, y,
-        fitted_selector, fitted_clf, hgb_model,
+        fitted_clf, hgb_model,
     )
 
 
+# ── Load or train model ──
 df = load_data()
-(
-    pipeline, fitted_scaler, features, selected_features, selected_mask,
-    cv_metrics, oof_preds, oof_probs, y_all,
-    fitted_selector, fitted_clf, hgb_model,
-) = train_model(df)
+_spinner_msg = (
+    "📂 Loading pre-trained model..."
+    if os.path.exists(MODEL_PATH)
+    else "🔄 Training model (first run — may take a minute)..."
+)
+with st.spinner(_spinner_msg):
+    (
+        pipeline, fitted_scaler, features, selected_features,
+        cv_metrics, oof_preds, oof_probs, y_all,
+        fitted_clf, hgb_model,
+    ) = train_model(df)
 
-JITTER_COLS = [
-    "MDVP:Jitter(%)", "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP",
-]
-SHIMMER_COLS = [
-    "MDVP:Shimmer", "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5",
-    "MDVP:APQ", "Shimmer:DDA",
-]
-FREQ_COLS = ["MDVP:Fo(Hz)", "MDVP:Fhi(Hz)", "MDVP:Flo(Hz)"]
+# ── Feature groups (only core retained features) ──
+JITTER_COLS = ["MDVP:Jitter(%)"]
+SHIMMER_COLS = ["MDVP:Shimmer"]
+FREQ_COLS = ["MDVP:Fo(Hz)", "MDVP:Flo(Hz)"]
 NONLINEAR_COLS = ["RPDE", "DFA", "spread1", "spread2", "D2", "PPE"]
-RATIO_COLS = ["NHR", "HNR"]
+RATIO_COLS = ["HNR"]
 
 PL = dict(
     paper_bgcolor="rgba(0,0,0,0)",
@@ -391,43 +432,83 @@ def hex_to_rgba(hex_color, alpha=0.2):
 
 def predict_single(x_raw):
     """Run a single raw feature vector through the production pipeline.
-    x_raw: np.ndarray of shape (1, n_features) — unscaled.
-    Returns (prediction, probability_array, x_selected_scaled).
+    x_raw: np.ndarray of shape (1, 11) — unscaled core features.
+    Returns (prediction, probability_array, x_scaled).
     """
     x_scaled = fitted_scaler.transform(x_raw)
-    x_selected = fitted_selector.transform(x_scaled)
-    pred = fitted_clf.predict(x_selected)[0]
-    prob = fitted_clf.predict_proba(x_selected)[0]
-    return pred, prob, x_selected
+    pred = fitted_clf.predict(x_scaled)[0]
+    prob = fitted_clf.predict_proba(x_scaled)[0]
+    return pred, prob, x_scaled
 
 
-def render_shap_plot(x_selected, feature_names_sel):
-    """Render a SHAP waterfall/force plot for the dominant HGB base estimator."""
+# ══════════════════════════════════════════════
+#  BULLETPROOF SHAP HELPERS
+# ══════════════════════════════════════════════
+def _safe_shap_single(sv):
+    """Extract SHAP values for a single sample's positive class.
+    Handles 0D, 1D, and 2D arrays safely.
+    """
+    if sv.ndim == 2:
+        return sv[:, 1]          # (features, 2) → positive class column
+    elif sv.ndim == 0:
+        return np.array([float(sv)])
+    return sv                    # 1D → already correct
+
+
+def _safe_shap_global(sv):
+    """Extract global SHAP values for positive class.
+    Handles 2D and 3D arrays safely.
+    """
+    if sv.ndim == 3:
+        return sv[:, :, 1]       # (samples, features, 2) → positive class
+    elif sv.ndim == 1:
+        return sv.reshape(1, -1)
+    return sv                    # 2D → already correct
+
+
+def _shap_bar_fallback(sv, feature_names_list):
+    """Render SHAP values as a Plotly horizontal bar chart (fallback)."""
+    shap_df = pd.DataFrame({
+        "Feature": feature_names_list,
+        "SHAP Value": sv,
+    }).sort_values("SHAP Value", key=abs, ascending=True)
+    fig = px.bar(
+        shap_df.tail(min(15, len(feature_names_list))),
+        y="Feature", x="SHAP Value",
+        orientation="h",
+        title="SHAP Feature Contributions",
+        color="SHAP Value",
+        color_continuous_scale="RdBu_r",
+        color_continuous_midpoint=0,
+    )
+    fig.update_layout(**PL, coloraxis_showscale=False, height=420)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_shap_plot(x_input, feature_names_list):
+    """Render a SHAP waterfall/force plot for the dominant HGB base estimator.
+    Handles 1D/2D/3D SHAP arrays safely for any shap library version."""
     try:
         explainer = shap.TreeExplainer(hgb_model)
-        shap_values = explainer(x_selected)
+        shap_values = explainer(x_input)
+        sv = _safe_shap_single(shap_values[0].values)
 
         if ST_SHAP_AVAILABLE:
-            st_shap(shap.plots.force(shap_values[0]), height=160)
+            try:
+                base = shap_values[0].base_values
+                if hasattr(base, '__len__') and len(base) > 1:
+                    base = float(base[1])
+                exp = shap.Explanation(
+                    values=sv,
+                    base_values=base,
+                    data=shap_values[0].data,
+                    feature_names=feature_names_list,
+                )
+                st_shap(shap.plots.force(exp), height=160)
+            except Exception:
+                _shap_bar_fallback(sv, feature_names_list)
         else:
-            # Fallback: render a Plotly bar chart of SHAP values
-            sv = shap_values[0].values
-            # For binary classification HGB, shap_values may be 2D
-            if sv.ndim > 1:
-                sv = sv[:, 1]
-            shap_df = pd.DataFrame({
-                "Feature": feature_names_sel,
-                "SHAP Value": sv,
-            }).sort_values("SHAP Value", key=abs, ascending=True)
-            fig = px.bar(
-                shap_df.tail(15), y="Feature", x="SHAP Value",
-                orientation="h", title="SHAP Feature Contributions (Top 15)",
-                color="SHAP Value",
-                color_continuous_scale="RdBu_r",
-                color_continuous_midpoint=0,
-            )
-            fig.update_layout(**PL, coloraxis_showscale=False, height=420)
-            st.plotly_chart(fig, use_container_width=True)
+            _shap_bar_fallback(sv, feature_names_list)
     except Exception as e:
         st.warning(f"SHAP explanation unavailable: {e}")
 
@@ -459,7 +540,7 @@ with st.sidebar:
     )
     st.markdown("---")
     st.caption(
-        "UCI Parkinson's Voice Dataset\n195 samples · 32 patients · 22 features"
+        f"UCI Parkinson's Voice Dataset\n195 samples · 32 patients · {len(features)} core features"
     )
 
 mask = df["label"].isin(status_filter)
@@ -471,11 +552,11 @@ dff = df[mask].copy()
 #  HERO + PULSE BAR
 # ══════════════════════════════════════════════
 st.markdown(
-    """
+    f"""
 <div class="hero">
   <span class="hero-emoji">🧠</span>
   <div class="hero-title">Parkinson's Voice Analytics</div>
-  <div class="hero-sub">Biomedical voice signal analysis · 22 acoustic features · ML-powered diagnosis prediction</div>
+  <div class="hero-sub">Biomedical voice signal analysis · {len(features)} core acoustic features · ML-powered diagnosis prediction</div>
   <span class="hero-badge">📊 195 Recordings · 32 Patients · UCI Dataset</span>
 </div>
 """,
@@ -581,11 +662,10 @@ with tab1:
         st.plotly_chart(fig2, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Radar chart
+    # Radar chart — core features only
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-    key_feats = [
-        "MDVP:Fo(Hz)", "HNR", "RPDE", "DFA", "PPE", "spread1", "spread2", "D2",
-    ]
+    key_feats = [f for f in ["MDVP:Fo(Hz)", "HNR", "RPDE", "DFA", "PPE",
+                              "spread1", "spread2", "D2"] if f in dff.columns]
     h_vals = dff[dff["status"] == 0][key_feats].mean().tolist()
     p_vals = dff[dff["status"] == 1][key_feats].mean().tolist()
     mms = MinMaxScaler()
@@ -622,19 +702,15 @@ with tab1:
     st.plotly_chart(fig3, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # Correlation heatmap
+    # Correlation heatmap — core features only
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
-    num_cols = [
-        c
-        for c in dff.columns
-        if dff[c].dtype in [np.float64, np.int64] and c != "status"
-    ]
-    corr = dff[num_cols + ["status"]].corr()
+    corr_cols = [c for c in features if c in dff.columns]
+    corr = dff[corr_cols + ["status"]].corr()
     fig4 = px.imshow(
         corr,
         text_auto=".2f",
         color_continuous_scale="RdBu_r",
-        title="Feature Correlation Matrix",
+        title="Feature Correlation Matrix (Core Features)",
         aspect="auto",
         zmin=-1,
         zmax=1,
@@ -723,16 +799,16 @@ with tab2:
         st.plotly_chart(fig7, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-# ── TAB 3: ML MODEL (OVERHAULED) ─────────────
+# ── TAB 3: ML MODEL ──────────────────────────
 with tab3:
     st.markdown(
-        '<div class="sec-hdr">🤖 Stacking Ensemble — Subject-Wise GroupKFold CV</div>',
+        '<div class="sec-hdr">🤖 Stacking Ensemble — Subject-Wise StratifiedGroupKFold CV</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        "Pipeline: **SMOTE** → **L1 Feature Selection** → "
+        "Pipeline: **SMOTE** → "
         "**StackingClassifier** (HGB + RF + SVC → LR meta)  ·  "
-        f"**{len(selected_features)}** / {len(features)} features selected"
+        f"**{len(features)}** core features (multicollinear features dropped)"
     )
 
     # ── 4 KPI Cards: Accuracy, F1, Sensitivity, Specificity ──
@@ -779,7 +855,7 @@ with tab3:
         ))
     fig_fold.update_layout(
         **PL,
-        title="Per-Fold Performance (Subject-Wise GroupKFold)",
+        title="Per-Fold Performance (Subject-Wise StratifiedGroupKFold)",
         barmode="group",
         yaxis_title="Score (%)",
         yaxis_range=[0, 105],
@@ -839,38 +915,36 @@ with tab3:
         st.plotly_chart(fig9, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Feature importance from dominant HGB model ──
+    # ── Feature importance from dominant HGB model (bulletproof SHAP) ──
     st.markdown('<div class="chart-card">', unsafe_allow_html=True)
     try:
-        # Use SHAP summary bar for global importance
-        X_selected_all = fitted_selector.transform(
-            fitted_scaler.transform(df[features].values)
-        )
+        X_scaled_all = fitted_scaler.transform(df[features].values)
         explainer = shap.TreeExplainer(hgb_model)
-        shap_values_all = explainer(X_selected_all)
-        sv = shap_values_all.values
-        if sv.ndim > 2:
-            sv = sv[:, :, 1]  # take class-1 SHAP values for binary
+        shap_values_all = explainer(X_scaled_all)
+        sv = _safe_shap_global(shap_values_all.values)
         mean_abs_shap = np.mean(np.abs(sv), axis=0)
         imp_df = pd.DataFrame({
             "Feature": selected_features,
             "Mean |SHAP|": mean_abs_shap,
         }).sort_values("Mean |SHAP|", ascending=True)
         fig10 = px.bar(
-            imp_df.tail(15),
+            imp_df,
             y="Feature",
             x="Mean |SHAP|",
             orientation="h",
-            title="Top 15 Features — Mean |SHAP| (HistGradientBoosting)",
+            title=f"All {len(features)} Core Features — Mean |SHAP| (HistGradientBoosting)",
             color="Mean |SHAP|",
             color_continuous_scale="Purples",
         )
         fig10.update_layout(**PL, coloraxis_showscale=False, height=420)
         st.plotly_chart(fig10, use_container_width=True)
     except Exception:
-        # Fallback to sklearn feature_importances_ if SHAP fails
         try:
-            importances = hgb_model.feature_importances_ if hasattr(hgb_model, 'feature_importances_') else np.zeros(len(selected_features))
+            importances = (
+                hgb_model.feature_importances_
+                if hasattr(hgb_model, 'feature_importances_')
+                else np.zeros(len(selected_features))
+            )
         except Exception:
             importances = np.zeros(len(selected_features))
         imp_df = pd.DataFrame({
@@ -878,11 +952,11 @@ with tab3:
             "Importance": importances,
         }).sort_values("Importance", ascending=True)
         fig10 = px.bar(
-            imp_df.tail(15),
+            imp_df,
             y="Feature",
             x="Importance",
             orientation="h",
-            title="Top 15 Feature Importances (HistGradientBoosting)",
+            title="Feature Importances (HistGradientBoosting)",
             color="Importance",
             color_continuous_scale="Purples",
         )
@@ -890,11 +964,20 @@ with tab3:
         st.plotly_chart(fig10, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Selected features list ──
-    with st.expander("📋 Selected Features After L1 Regularisation"):
-        st.write(f"**{len(selected_features)}** of {len(features)} features retained:")
-        sel_df = pd.DataFrame({"#": range(1, len(selected_features) + 1), "Feature": selected_features})
+    # ── Core features list ──
+    with st.expander(f"📋 All {len(features)} Core Acoustic Features Used"):
+        st.write(
+            f"**{len(features)}** core features retained after dropping "
+            f"**{len(FEATURES_TO_DROP)}** redundant/multicollinear features:"
+        )
+        sel_df = pd.DataFrame({
+            "#": range(1, len(selected_features) + 1),
+            "Feature": selected_features,
+        })
         st.dataframe(sel_df, use_container_width=True, hide_index=True)
+        st.caption(
+            f"**Dropped features:** {', '.join(FEATURES_TO_DROP)}"
+        )
 
 # ── TAB 4: PREDICT ───────────────────────────
 with tab4:
@@ -938,7 +1021,7 @@ with tab4:
         "🔍 Run Prediction", use_container_width=True, type="primary"
     ):
         x_in = np.array([[input_vals[f] for f in features]])
-        pred, prob, x_selected = predict_single(x_in)
+        pred, prob, x_scaled = predict_single(x_in)
         conf = round(prob[pred] * 100, 1)
 
         if pred == 1:
@@ -966,13 +1049,13 @@ with tab4:
                 unsafe_allow_html=True,
             )
 
-        # ── SHAP Explanation (replaces gauge chart) ──
+        # ── SHAP Explanation ──
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
         st.markdown(
             '<div class="sec-hdr">🔍 SHAP Feature Contribution Analysis</div>',
             unsafe_allow_html=True,
         )
-        render_shap_plot(x_selected, selected_features)
+        render_shap_plot(x_scaled, selected_features)
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.caption("⚠️ Educational/research use only. Not a clinical diagnostic tool.")
@@ -990,7 +1073,7 @@ with tab5:
     if search:
         disp = disp[disp["patient_id"].str.contains(search, case=False)]
 
-    show_cols = ["name", "label"] + features[:10]
+    show_cols = ["name", "label"] + list(features)
     st.dataframe(
         disp[show_cols].head(n_rows).reset_index(drop=True),
         use_container_width=True,
@@ -1230,7 +1313,7 @@ def generate_voice_docx(
         p_.add_run(rec).font.size = Pt(10)
     doc.add_paragraph()
 
-    # 6. MODEL METRICS (updated with actual CV metrics)
+    # 6. MODEL METRICS (actual CV metrics)
     _sec_hdr(doc, "6", "Model Performance Metrics")
     mm = doc.add_table(rows=2, cols=4)
     mm.style = "Table Grid"
@@ -1271,31 +1354,143 @@ def generate_voice_docx(
     return buf
 
 
-def extract_voice_features(file_path):
-    import numpy as _np
+# ══════════════════════════════════════════════
+#  REAL VOICE FEATURE EXTRACTION (parselmouth)
+# ══════════════════════════════════════════════
+def _safe_praat_val(val, default=0.0):
+    """Return a safe float from a Praat call that may return NaN/None/undefined."""
+    if val is None:
+        return default
+    try:
+        fval = float(val)
+        if np.isnan(fval) or np.isinf(fval):
+            return default
+        return fval
+    except (ValueError, TypeError):
+        return default
 
+
+def extract_voice_features(file_path):
+    """Extract all 22 acoustic features from a WAV file using parselmouth (Praat).
+
+    Computes real Jitter, Shimmer, HNR, NHR, and fundamental frequency metrics.
+    Nonlinear dynamics features (RPDE, DFA, spread1/2, D2, PPE) use dataset-median
+    defaults since they require specialised toolboxes beyond parselmouth.
+
+    Returns:
+        core_array: np.ndarray of shape (1, 11) — core features for model prediction
+        fo: float — mean fundamental frequency
+        hnr: float — harmonics-to-noise ratio
+        all_feature_names: list[str] — all 22 feature names (for DOCX report)
+        all_feature_values: list[float] — all 22 feature values (for DOCX report)
+    """
     sound = parselmouth.Sound(file_path)
     pitch = sound.to_pitch()
+    point_process = parselmouth.praat.call(
+        [sound, pitch], "To PointProcess (cc)"
+    )
+
+    # ── Fundamental Frequency ──
     pv = pitch.selected_array["frequency"]
     pv = pv[pv != 0]
-    fo = float(_np.mean(pv))
-    fhi = float(_np.max(pv))
-    flo = float(_np.min(pv))
-    harm = sound.to_harmonicity()
-    hnr = float(harm.values[harm.values != -200].mean())
-    feats = [
+    if len(pv) == 0:
+        fo, fhi, flo = 150.0, 200.0, 100.0
+    else:
+        fo = float(np.mean(pv))
+        fhi = float(np.max(pv))
+        flo = float(np.min(pv))
+
+    # ── Jitter (real computation) ──
+    jitter_local = _safe_praat_val(
+        parselmouth.praat.call(point_process,
+                              "Get jitter (local)", 0, 0, 0.0001, 0.02, 1.3),
+        0.005,
+    )
+    jitter_local_abs = _safe_praat_val(
+        parselmouth.praat.call(point_process,
+                              "Get jitter (local, absolute)", 0, 0, 0.0001, 0.02, 1.3),
+        0.00003,
+    )
+    jitter_rap = _safe_praat_val(
+        parselmouth.praat.call(point_process,
+                              "Get jitter (rap)", 0, 0, 0.0001, 0.02, 1.3),
+        0.003,
+    )
+    jitter_ppq5 = _safe_praat_val(
+        parselmouth.praat.call(point_process,
+                              "Get jitter (ppq5)", 0, 0, 0.0001, 0.02, 1.3),
+        0.003,
+    )
+    jitter_ddp = 3.0 * jitter_rap   # DDP = 3 × RAP
+
+    # ── Shimmer (real computation) ──
+    shimmer_local = _safe_praat_val(
+        parselmouth.praat.call([sound, point_process],
+                              "Get shimmer (local)", 0, 0, 0.0001, 0.02, 1.3, 1.6),
+        0.03,
+    )
+    shimmer_local_dB = _safe_praat_val(
+        parselmouth.praat.call([sound, point_process],
+                              "Get shimmer (local_dB)", 0, 0, 0.0001, 0.02, 1.3, 1.6),
+        0.30,
+    )
+    shimmer_apq3 = _safe_praat_val(
+        parselmouth.praat.call([sound, point_process],
+                              "Get shimmer (apq3)", 0, 0, 0.0001, 0.02, 1.3, 1.6),
+        0.015,
+    )
+    shimmer_apq5 = _safe_praat_val(
+        parselmouth.praat.call([sound, point_process],
+                              "Get shimmer (apq5)", 0, 0, 0.0001, 0.02, 1.3, 1.6),
+        0.02,
+    )
+    shimmer_apq11 = _safe_praat_val(
+        parselmouth.praat.call([sound, point_process],
+                              "Get shimmer (apq11)", 0, 0, 0.0001, 0.02, 1.3, 1.6),
+        0.02,
+    )
+    shimmer_dda = 3.0 * shimmer_apq3   # DDA = 3 × APQ3
+
+    # ── Harmonics ──
+    harmonicity = sound.to_harmonicity()
+    hnr_vals = harmonicity.values[harmonicity.values != -200]
+    hnr = float(np.mean(hnr_vals)) if len(hnr_vals) > 0 else 20.0
+    nhr = 1.0 / (10 ** (hnr / 10)) if hnr > 0 else 0.05
+
+    # ── Nonlinear dynamics (dataset-median defaults) ──
+    # These require specialised algorithms (recurrence analysis, fractal scaling)
+    # not available in parselmouth. Using Parkinson's dataset median values.
+    rpde = 0.4986
+    dfa = 0.7183
+    spread1 = -5.6844
+    spread2 = 0.2269
+    d2 = 2.3019
+    ppe = 0.2068
+
+    # ── All 22 features in dataset column order (for DOCX report) ──
+    all_feature_names = [
+        "MDVP:Fo(Hz)", "MDVP:Fhi(Hz)", "MDVP:Flo(Hz)",
+        "MDVP:Jitter(%)", "MDVP:Jitter(Abs)", "MDVP:RAP", "MDVP:PPQ", "Jitter:DDP",
+        "MDVP:Shimmer", "MDVP:Shimmer(dB)", "Shimmer:APQ3", "Shimmer:APQ5",
+        "MDVP:APQ", "Shimmer:DDA",
+        "NHR", "HNR",
+        "RPDE", "DFA", "spread1", "spread2", "D2", "PPE",
+    ]
+    all_feature_values = [
         fo, fhi, flo,
-        0.005, 0.00003, 0.002, 0.004, 0.006,
-        0.03, 0.35, 0.015, 0.02, 0.018, 0.045,
-        0.015, hnr, 0.35, 0.75, -5.2, 0.20, 2.0, 0.20,
+        jitter_local, jitter_local_abs, jitter_rap, jitter_ppq5, jitter_ddp,
+        shimmer_local, shimmer_local_dB, shimmer_apq3, shimmer_apq5,
+        shimmer_apq11, shimmer_dda,
+        nhr, hnr,
+        rpde, dfa, spread1, spread2, d2, ppe,
     ]
-    fnames = [
-        "Fo (Hz)", "Fhi (Hz)", "Flo (Hz)",
-        "Jitter (%)", "Jitter Abs", "RAP", "PPQ", "DDP",
-        "Shimmer", "Shimmer (dB)", "APQ3", "APQ5", "APQ", "DDA",
-        "NHR", "HNR", "RPDE", "DFA", "spread1", "spread2", "D2", "PPE",
-    ]
-    return _np.array(feats).reshape(1, -1), fo, hnr, fnames, feats
+
+    # ── Core 11 features for model prediction (in trained order) ──
+    all_feats_dict = dict(zip(all_feature_names, all_feature_values))
+    core_values = [all_feats_dict[f] for f in features]
+    core_array = np.array(core_values).reshape(1, -1)
+
+    return core_array, fo, hnr, all_feature_names, all_feature_values
 
 
 # ══════════════════════════════════════════════
@@ -1399,7 +1594,7 @@ with tab6:
         last_hnr = 0.0
         last_fn = []
         last_fv = []
-        last_x_selected = None
+        last_x_scaled = None
         src_label = "WAV Upload"
 
         with st.spinner("Analyzing voice..."):
@@ -1410,11 +1605,11 @@ with tab6:
                     ) as tmp:
                         tmp.write(f.read())
                         path = tmp.name
-                    raw_feats, fo, hnr, fn, fv = extract_voice_features(path)
-                    pred, prob, x_sel = predict_single(raw_feats)
+                    core_feats, fo, hnr, fn, fv = extract_voice_features(path)
+                    pred, prob, x_sc = predict_single(core_feats)
                     probs.append(float(prob[1]))
                     last_fo, last_hnr, last_fn, last_fv = fo, hnr, fn, fv
-                    last_x_selected = x_sel
+                    last_x_scaled = x_sc
                     os.unlink(path)
 
             if has_v_record:
@@ -1426,12 +1621,12 @@ with tab6:
                 ) as tmp:
                     tmp.write(v_recorded)
                     path = tmp.name
-                raw_feats, fo, hnr, fn, fv = extract_voice_features(path)
-                pred, prob, x_sel = predict_single(raw_feats)
+                core_feats, fo, hnr, fn, fv = extract_voice_features(path)
+                pred, prob, x_sc = predict_single(core_feats)
                 probs.append(float(prob[1]))
                 if not has_v_upload:
                     last_fo, last_hnr, last_fn, last_fv = fo, hnr, fn, fv
-                last_x_selected = x_sel
+                last_x_scaled = x_sc
                 os.unlink(path)
 
         pk_prob = float(np.mean(probs))
@@ -1443,14 +1638,14 @@ with tab6:
         m2.metric("🟢 Healthy Probability", f"{hl_prob * 100:.2f}%")
         m3.metric("📊 AUC Score", f"{auc(*roc_curve(y_all, oof_probs)[:2]):.3f}")
 
-        # ── SHAP Explanation (replaces gauge chart) ──
+        # ── SHAP Explanation ──
         st.markdown('<div class="chart-card">', unsafe_allow_html=True)
         st.markdown(
             '<div class="sec-hdr">🔍 SHAP Feature Contribution Analysis</div>',
             unsafe_allow_html=True,
         )
-        if last_x_selected is not None:
-            render_shap_plot(last_x_selected, selected_features)
+        if last_x_scaled is not None:
+            render_shap_plot(last_x_scaled, selected_features)
         st.markdown("</div>", unsafe_allow_html=True)
 
         # Risk + result box
@@ -1511,5 +1706,5 @@ with tab6:
 st.markdown("---")
 st.caption(
     "🧠 Parkinson's Voice Analytics · UCI ML Repository · "
-    "Streamlit + Plotly + Stacking Ensemble + SHAP"
+    "Streamlit + Plotly + Stacking Ensemble + SHAP + joblib"
 )
