@@ -8,7 +8,7 @@ from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.metrics import (
     accuracy_score, f1_score, recall_score, confusion_matrix, roc_curve, auc,
 )
-from sklearn.model_selection import GroupKFold, cross_val_predict
+from sklearn.model_selection import StratifiedGroupKFold, cross_val_predict
 from sklearn.ensemble import (
     RandomForestClassifier, StackingClassifier, HistGradientBoostingClassifier,
 )
@@ -279,9 +279,10 @@ def _build_pipeline():
 
 
 @st.cache_resource
-def train_model(df):
+def train_model(df, _version="v3_stratified_groupkfold"):
     """
-    Train with strict subject-wise GroupKFold cross-validation.
+    Train with strict subject-wise StratifiedGroupKFold cross-validation.
+    Ensures both classes appear in every fold (no data leakage + stratification).
     Returns: fitted pipeline, scaler, feature names, CV metrics dict,
              out-of-fold predictions, and the dominant base model for SHAP.
     """
@@ -292,8 +293,8 @@ def train_model(df):
 
     pipeline = _build_pipeline()
 
-    # ── Subject-wise GroupKFold CV (no data leakage) ──
-    gkf = GroupKFold(n_splits=5)
+    # ── Subject-wise StratifiedGroupKFold CV (no data leakage + class balance) ──
+    gkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
 
     fold_acc, fold_f1, fold_sens, fold_spec = [], [], [], []
     oof_preds = np.zeros(len(y), dtype=int)
